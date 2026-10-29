@@ -237,7 +237,9 @@ def class_colours(visited_colours):
 
 
 def build_palette(prm, visited_colours):
+    """Every (texel, lighting level) colour, worked out once at start-up."""
     classes = class_colours(visited_colours)
+    used = 3 + 2 * min(len(visited_colours), 14)
     weights = []
     for level in range(LEVELS):
         dot = dot_of(level)
@@ -245,20 +247,29 @@ def build_palette(prm, visited_colours):
         sun = 0.3 + 0.7 * max(0.0, dot) ** 0.8
         glow = math.exp(-((dot + 0.02) / 0.05) ** 2) * 0.32
         lights = (1.0 - smoothstep(-0.14, 0.02, dot)) ** 1.5
-        weights.append((daylight * sun, 1.0 - daylight, glow, lights))
+        weights.append((daylight * sun, 1.0 - daylight,
+                        SUNSET[0] * glow * 0.5, SUNSET[1] * glow * 0.4, SUNSET[2] * glow * 0.3, lights))
     for value in range(256):
-        day, night, lit = classes[value & 31]
+        cls = value & 31
+        base = _PALETTE + (value << 5)
+        if cls >= used or (cls == 0 and value):
+            # Classes nobody uses look like locked land, and the sea has no
+            # city lights: copy rows already worked out.
+            source = _PALETTE + (((value & 0xE0) | 1) << 5 if cls else 0)
+            for level in range(LEVELS):
+                prm[base + level] = prm[source + level]
+            continue
+        day, night, lit = classes[cls]
         brightness = (value >> 5) / 7
         light = brightness * brightness * 0.9 if lit else 0.0
-        base = _PALETTE + (value << 5)
+        dr, dg, db = day
+        nr, ng, nb = night
+        cr, cg, cb = CITY_LIGHT[0] * light, CITY_LIGHT[1] * light, CITY_LIGHT[2] * light
         for level in range(LEVELS):
-            d, n, glow, lights = weights[level]
-            shine = light * lights
-            prm[base + level] = pack(
-                day[0] * d + night[0] * n + SUNSET[0] * glow * 0.5 + CITY_LIGHT[0] * shine,
-                day[1] * d + night[1] * n + SUNSET[1] * glow * 0.4 + CITY_LIGHT[1] * shine,
-                day[2] * d + night[2] * n + SUNSET[2] * glow * 0.3 + CITY_LIGHT[2] * shine,
-            )
+            d, n, gr, gg, gb, lights = weights[level]
+            prm[base + level] = pack(dr * d + nr * n + gr + cr * lights,
+                                     dg * d + ng * n + gg + cg * lights,
+                                     db * d + nb * n + gb + cb * lights)
 
 
 class Globe:

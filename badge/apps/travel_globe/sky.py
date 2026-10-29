@@ -109,9 +109,9 @@ def to_vector(lat, lon):
 
 
 def rtc_now():
-    """The badge clock as (day, second, plausible). The clock is taken as UTC."""
+    """The badge clock as (day, second), taken as UTC."""
     year, month, mday, hour, minute, second = time.gmtime()[:6]
-    return days_from_civil(year, month, mday), hour * 3600 + minute * 60 + second, year >= 2025
+    return days_from_civil(year, month, mday), hour * 3600 + minute * 60 + second
 
 
 class Clock:
@@ -132,19 +132,16 @@ class Clock:
         self.read()
 
     def read(self):
-        day, second, valid = rtc_now()
-        self.valid = valid
-        if not valid:
+        day, second = rtc_now()
+        # The NTP correction goes on first: it can turn an unset clock into a
+        # real one, years later.
+        extra, second = divmod(second + self.correction, DAY)
+        day += extra
+        self.valid = civil_from_days(day)[0] >= 2025
+        if not self.valid:
             day = self.FALLBACK_DAY
-        second += self.correction + self.ahead_seconds
-        day += self.ahead_days
-        while second >= DAY:
-            second -= DAY
-            day += 1
-        while second < 0:
-            second += DAY
-            day -= 1
-        self.day, self.second = day, second
+        extra, second = divmod(second + self.ahead_seconds, DAY)
+        self.day, self.second = int(day + extra + self.ahead_days), second
 
     def advance(self, elapsed_ms):
         if self.speed != 1:

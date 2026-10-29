@@ -118,6 +118,7 @@ def loading(step, done=[0]):
     badge.update()
 
 
+booted_at = time.ticks_ms()
 loading("Opening the atlas")
 with open("assets/countries.json", "r") as handle:
     COUNTRIES = json.load(handle)            # [code, name, label lon, label lat] by id - 1
@@ -257,6 +258,7 @@ rim_brush = brush.gradient(brush.RADIAL, 0.5, 0.5, 1.0, 0.5, RIM_STOPS, mat3())
 clock = sky.Clock()
 sync = TimeSync()
 tilt = Tilt()
+print("travel_globe: ready in %d ms" % time.ticks_diff(time.ticks_ms(), booted_at))
 
 mode = "spin"               # spin, focus or tour
 focus = None                # the Place in view, when focused or touring
