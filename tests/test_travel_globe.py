@@ -147,6 +147,19 @@ class GlobeTests(unittest.TestCase):
         cls.globe = load_globe()
         cls.tab = cls.globe.build_tables()
 
+    def test_maps_load_from_paletted_or_rgba_decodes(self):
+        g = self.globe
+        indexed = bytearray((i * 7) % 251 for i in range(g.TEX_W * g.TEX_H))
+        rgba = bytearray(4 * len(indexed))
+        rgba[0::4] = indexed
+        for decoded in (indexed, rgba):
+            g.image = types.SimpleNamespace(load=lambda path, data=decoded: data)
+            _, texels = g.load_map("assets/ids.png")
+            self.assertEqual(bytes(texels), bytes(indexed))
+        g.image = types.SimpleNamespace(load=lambda path: bytearray(10))
+        with self.assertRaises(ValueError):
+            g.load_map("assets/ids.png")
+
     def test_longitude_table_matches_atan2(self):
         g, tab = self.globe, self.tab
         for qy in range(258):

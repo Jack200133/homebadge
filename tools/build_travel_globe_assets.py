@@ -189,20 +189,21 @@ def save_paletted(array, path, palette):
 
 
 def id_palette(count):
-    palette = [8, 20, 48]
-    for index in range(1, 256):
-        hue = (index * 0.618034) % 1.0
-        palette += [int(80 + 120 * hue), int(110 + 60 * (1 - hue)), int(90 + 50 * ((index * 7) % 5) / 4)]
-    return palette[: 256 * 3]
+    """Red is the id itself, so the map still reads right if a decoder expands
+    the PNG to RGBA; green and blue tell neighbours apart when viewing it."""
+    palette = []
+    for index in range(256):
+        palette += [index, 40 + (index * 89) % 200, 40 + (index * 53) % 200] if index else [0, 20, 48]
+    return palette
 
 
 def aux_palette():
+    """Red is the value itself (see id_palette); green and blue show it."""
     palette = []
     for value in range(256):
         light = value & 7
-        border = value & 8
         level = int(255 * light / LIGHT_LEVELS)
-        palette += [255, 230, 160] if border else [level, int(level * 0.8), int(level * 0.4)]
+        palette += [value, 230 if value & 8 else int(level * 0.8), 160 if value & 8 else int(level * 0.4)]
     return palette
 
 

@@ -7,8 +7,10 @@
 # point) and runs as viper code on the badge. The simulator runs viper as
 # plain Python, where it is still quick enough at half resolution.
 
+import gc
 import math
 import sys
+import time
 from array import array
 
 from micropython import const
@@ -89,6 +91,40 @@ def build_tables():
     for k in range(_TABLES - _O_SHADE):
         tab[_O_SHADE + k] = level_of((k * 128 - 16448) / ONE)
     return tab
+
+
+@micropython.viper
+def _red_channel(rgba, out, count: int):
+    # Palette index from an RGBA decode: the maps' palettes keep it in red.
+    src = ptr8(rgba)
+    dst = ptr8(out)
+    i = 0
+    while i < count:
+        dst[i] = src[i << 2]
+        i += 1
+
+
+def load_map(path):
+    """A 1024 x 512 map as one byte a texel, whatever the PNG decoder gives."""
+    picture = image.load(path)
+    texels = memoryview(picture)
+    if len(texels) == TEX_W * TEX_H:
+        return picture, texels
+    if len(texels) == 4 * TEX_W * TEX_H:
+        out = bytearray(TEX_W * TEX_H)
+        _red_channel(texels, out, TEX_W * TEX_H)
+        return None, out
+    raise ValueError("%s must be a 1024 x 512 paletted PNG" % path)
+
+
+def frame_buffer(width, height):
+    """An image to render into and the 32-bit pixels viper writes."""
+    if SIMULATOR:
+        # Plain Python needs 32-bit items, and memoryview(image) is bytes.
+        pixels = array("i", bytes(4 * width * height))
+        return image(width, height, pixels), pixels
+    picture = image(width, height)
+    return picture, memoryview(picture)
 
 
 @micropython.viper
@@ -279,13 +315,9 @@ class Globe:
         """visited_ids maps a country id (index + 1 in countries.json) to its slot."""
         report = progress or (lambda step: None)
         report("Reading the map")
-        self.ids_image = image.load("assets/ids.png")
-        self.ids = memoryview(self.ids_image)
-        lights_image = image.load("assets/aux.png")
-        self.tex_image = lights_image
-        self.tex = memoryview(lights_image)
-        if len(self.ids) != TEX_W * TEX_H or len(self.tex) != TEX_W * TEX_H:
-            raise ValueError("the map textures must be 1024 x 512 paletted PNGs")
+        # The images are kept so the memory under the views stays alive.
+        self.ids_image, self.ids = load_map("assets/ids.png")
+        self.tex_image, self.tex = load_map("assets/aux.png")
 
         report("Unlocking countries")
         lut = bytearray(512)
@@ -298,17 +330,16 @@ class Globe:
 
         report("Measuring the sphere")
         self.tab = build_tables()
+        gc.collect()
 
         report("Mixing the colours")
         self.prm = array("i", bytes(4 * (_PALETTE + 256 * LEVELS)))
         build_palette(self.prm, visited_colours)
 
         report("Lighting the cities")
-        self.full = array("i", bytes(4 * screen.width * screen.height))
-        self.full_image = image(screen.width, screen.height, self.full)
-        hw, hh = screen.width // 2, screen.height // 2
-        self.half = array("i", bytes(4 * hw * hh))
-        self.half_image = image(hw, hh, self.half)
+        self.full_image, self.full = frame_buffer(screen.width, screen.height)
+        self.half_image, self.half = frame_buffer(screen.width // 2, screen.height // 2)
+        gc.collect()
         self.last_key = None
         self.last_scale = 1
         self.last_box = None
@@ -316,11 +347,14 @@ class Globe:
     def country_at(self, lat, lon):
         """The country id under a point, 0 for the sea."""
         row = max(0, min(TEX_H - 1, int((90.0 - lat) / 180.0 * TEX_H)))
-        col = int((lon + 180.0) / 360.0 * TEX_W) % TEX_W
+        col = int(((lon + 180.0) % 360.0) / 360.0 * TEX_W) % TEX_W
         return self.ids[row * TEX_W + col]
 
     def draw(self, cx, cy, radius, east, north, out, sun, scale):
-        """Render and blit the globe. Returns True if the pixels were recomputed.
+        """Render and blit the globe.
+
+        Returns (microseconds, pixels) for the render, or (0, 0) when the
+        last frame's pixels were reused.
 
         east, north and out are the world directions of the screen's right,
         up and towards-the-viewer axes; sun is the direction of the sun.
@@ -336,14 +370,14 @@ class Globe:
         x0, x1 = max(0, icx - irad - 1), min(width, icx + irad + 2)
         y0, y1 = max(0, icy - irad - 1), min(height, icy + irad + 2)
         if x1 <= x0 or y1 <= y0:
-            return False
+            return 0, 0
 
         rows = []
         for vector in (east, north, out, sun):
             rows.extend(int(c * ONE + (0.5 if c >= 0 else -0.5)) for c in vector)
         key = (scale, icx, icy, irad, tuple(rows))
-        fresh = key != self.last_key
-        if fresh:
+        spent = pixels = 0
+        if key != self.last_key:
             p = self.prm
             inv = (1 << 20) // irad
             p[0] = width
@@ -362,7 +396,10 @@ class Globe:
             p[23] = (rows[0] * inv) >> 6
             p[24] = (rows[1] * inv) >> 6
             p[25] = (rows[2] * inv) >> 6
+            started = time.ticks_us()
             _render(buffer, self.tex, self.tab, p)
+            spent = time.ticks_diff(time.ticks_us(), started)
+            pixels = (x1 - x0) * (y1 - y0)
             self.last_key = key
 
         if scale == 2:
@@ -370,4 +407,4 @@ class Globe:
                         rect(x0 * 2, y0 * 2, (x1 - x0) * 2, (y1 - y0) * 2))
         else:
             screen.blit(picture, rect(x0, y0, x1 - x0, y1 - y0), rect(x0, y0, x1 - x0, y1 - y0))
-        return fresh
+        return spent, pixels

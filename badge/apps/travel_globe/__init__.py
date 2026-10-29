@@ -83,6 +83,7 @@ CARD_EDGE = color.rgb(255, 255, 255, 36)
 SUN_PEN = color.rgb(255, 210, 80)
 MOON_PEN = color.rgb(214, 222, 240)
 TWILIGHT_PEN = color.rgb(255, 150, 90)
+LOCKED_TEXT = color.rgb(110, 118, 132)
 
 name_font = font.absolute
 small_font = font.sins
@@ -118,8 +119,79 @@ def loading(step, done=[0]):
     badge.update()
 
 
+class TimeSync:
+    """Sets the globe's clock from the internet once, when Wi-Fi is configured.
+
+    The badge clock may hold local time (the Clock app sets it that way), and
+    the sun has to be placed from UTC, so an NTP reading wins when one comes.
+    """
+
+    GIVE_UP_MS = 60000
+    RETRY_MS = 8000
+    ATTEMPTS = 3
+
+    def __init__(self):
+        self.state = "off"
+        self.wifi = None
+        # Wi-Fi only sharpens the clock, so nothing it does may stop the globe.
+        try:
+            import missing_details
+            if missing_details.missing("WIFI_SSID"):
+                return
+            import wifi
+            # Retries are set high so wifi never puts up its own error page;
+            # this gives up on its own after GIVE_UP_MS instead.
+            wifi.connect(timeout=10, retries=100000)
+        except Exception as reason:
+            print("travel_globe: no Wi-Fi:", reason)
+            return
+        self.wifi = wifi
+        self.started = badge.ticks
+        self.retry_at = 0
+        self.attempts = 0
+        self.state = "connecting"
+
+    def finish(self, state):
+        self.state = state
+        disconnect = getattr(self.wifi, "disconnect", None)
+        if disconnect is not None:
+            try:
+                disconnect()            # the radio is not needed again
+            except Exception:
+                pass
+
+    def step(self, clock):
+        if self.state != "connecting":
+            return
+        now = badge.ticks
+        if now - self.started > self.GIVE_UP_MS:
+            self.finish("failed")
+            return
+        if now < self.retry_at:
+            return
+        try:
+            if not self.wifi.connect():
+                return
+            import ntptime
+            # The request blocks for up to this long, once.
+            ntptime.timeout = 1
+            clock.correction = ntptime.time() - time.time()
+        except Exception as reason:
+            self.attempts += 1
+            print("travel_globe: time sync failed:", reason)
+            if self.attempts >= self.ATTEMPTS:
+                self.finish("failed")
+            else:
+                self.retry_at = now + self.RETRY_MS
+            return
+        clock.read()
+        self.finish("synced")
+
+
 booted_at = time.ticks_ms()
 loading("Opening the atlas")
+# The radio starts before the map is read, so it can associate meanwhile.
+sync = TimeSync()
 with open("assets/countries.json", "r") as handle:
     COUNTRIES = json.load(handle)            # [code, name, label lon, label lat] by id - 1
 ids_by_code = {entry[0]: index + 1 for index, entry in enumerate(COUNTRIES)}
@@ -158,10 +230,14 @@ class Tilt:
         self.flipped = None
 
     def update(self):
-        ax, _, az = badge.imu()[:3]
-        flipped = badge.upside_down()
+        ax, ay, az = badge.imu()[:3]
+        if not (ax or ay or az):
+            return                  # no reading from the sensor yet
+        # Upside down, the display turns half a turn in its own plane: across
+        # the screen reverses, towards the viewer does not.
+        flipped = badge.rotate_180()
         if flipped:
-            ax, az = -ax, -az
+            ax = -ax
         if flipped != self.flipped:
             self.flipped = flipped
             self.rest_z = None
@@ -179,64 +255,24 @@ class Tilt:
         self.y += (target_y - self.y) * smooth
 
 
-class TimeSync:
-    """Sets the globe's clock from the internet once, when Wi-Fi is configured.
-
-    The badge clock may hold local time (the Clock app sets it that way), and
-    the sun has to be placed from UTC, so an NTP reading wins when one comes.
-    """
-
-    GIVE_UP_MS = 45000
-
-    def __init__(self):
-        self.state = "off"
-        self.wifi = None
-        try:
-            import missing_details
-            if missing_details.missing("WIFI_SSID"):
-                return
-            import wifi
-        except ImportError:
-            return
-        self.wifi = wifi
-        self.started = badge.ticks
-        # Retries are set high so wifi never puts up its own error page; this
-        # gives up on its own after GIVE_UP_MS instead.
-        wifi.connect(timeout=10, retries=100000)
-        self.state = "connecting"
-
-    def step(self, clock):
-        if self.state != "connecting":
-            return
-        if badge.ticks - self.started > self.GIVE_UP_MS:
-            self.state = "failed"
-            return
-        try:
-            if not self.wifi.connect():
-                return
-            import ntptime
-            clock.correction = ntptime.time() - time.time()
-            clock.read()
-            self.state = "synced"
-        except (OSError, AttributeError, ValueError) as reason:
-            print("travel_globe: time sync failed:", reason)
-            self.state = "failed"
-
-
 def make_stars(count):
-    stars = []
+    """Star positions in four brightness groups, so each group needs one pen."""
+    groups = [[], [], [], []]
     seed = 1234567
     for index in range(count):
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
         x = seed % WIDTH
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        y = seed % HEIGHT
-        stars.append((x, y, index % 4, (seed >> 8) % 628))
-    return stars
+        groups[index % 4].append((x, seed % HEIGHT))
+    return groups
 
 
 STARS = make_stars(90)
 STAR_PENS = [color.rgb(v, v, v + 10) for v in (60, 95, 140, 210)]
+
+# Past this radius the globe covers the whole screen: from the centre of the
+# globe to the furthest corner.
+COVERS_SCREEN = math.sqrt(max(CENTRE_X, WIDTH - CENTRE_X) ** 2 + max(CENTRE_Y, HEIGHT - CENTRE_Y) ** 2)
 
 GLOW_STOPS = [
     (0.0, color.rgb(70, 150, 255, 0)),
@@ -252,11 +288,12 @@ RIM_STOPS = [
     (1.0, color.rgb(160, 210, 255, 140)),
 ]
 GLOW_REACH = 1.17
+GLOW_FROM = 0.97            # the glow is clear inside this much of the radius
+RIM_FROM = 0.77             # and so is the rim
 glow_brush = brush.gradient(brush.RADIAL, 0.5, 0.5, 1.0, 0.5, GLOW_STOPS, mat3())
 rim_brush = brush.gradient(brush.RADIAL, 0.5, 0.5, 1.0, 0.5, RIM_STOPS, mat3())
 
 clock = sky.Clock()
-sync = TimeSync()
 tilt = Tilt()
 print("travel_globe: ready in %d ms" % time.ticks_diff(time.ticks_ms(), booted_at))
 
@@ -272,8 +309,10 @@ scale = 1
 cost_us = 2.0               # measured microseconds a globe pixel
 still_frames = 0
 last_view = None
+held_view = None            # the view actually drawn, which moves in pixel steps
 sun = (1.0, 0.0, 0.0)
-sun_second = None
+sun_at = None               # (day, second) the sun was last placed for
+SUN_EVERY_S = 30            # the terminator moves a quarter of a degree a minute
 frames = 0
 report_at = 0
 started_at = badge.ticks
@@ -363,11 +402,23 @@ def move_camera(dt):
     zoom *= math.exp(math.log(zoom_target / zoom) * ease)
 
 
-def view_axes():
-    """Screen right, up and out of the screen, as world directions."""
-    lon = round(cam_lon - tilt.x * TILT_LON_DEGREES, 1)
-    lat = round(max(-80.0, min(80.0, cam_lat + tilt.y * TILT_LAT_DEGREES)), 1)
-    roll = math.radians(round(tilt.x * TILT_ROLL_DEGREES, 1))
+def view_axes(radius):
+    """Screen right, up and out of the screen, as world directions.
+
+    The view only moves once the camera has gone about half a pixel, so a
+    hand's tremor does not redraw a globe that looks the same.
+    """
+    global held_view
+    lon = cam_lon - tilt.x * TILT_LON_DEGREES
+    lat = max(-80.0, min(80.0, cam_lat + tilt.y * TILT_LAT_DEGREES))
+    roll = tilt.x * TILT_ROLL_DEGREES
+    step = max(0.05, math.degrees(0.5 / radius))
+    if held_view is not None:
+        held_lon, held_lat, held_roll = held_view
+        if abs(shortest(lon - held_lon)) < step and abs(lat - held_lat) < step and abs(roll - held_roll) < 4 * step:
+            lon, lat, roll = held_view
+    held_view = (lon, lat, roll)
+    roll = math.radians(roll)
     lam, phi = math.radians(lon), math.radians(lat)
     cl, sl, cp, sp = math.cos(lam), math.sin(lam), math.cos(phi), math.sin(phi)
     out = (cp * cl, cp * sl, sp)
@@ -380,37 +431,48 @@ def view_axes():
 
 
 def update_sun():
-    global sun, sun_second
-    second = int(clock.second)
-    if clock.speed == 1 and second == sun_second:
+    """Place the sun: every frame in a time-lapse, every SUN_EVERY_S when live."""
+    global sun, sun_at
+    if (clock.speed == 1 and sun_at is not None and sun_at[0] == clock.day
+            and 0 <= clock.second - sun_at[1] < SUN_EVERY_S):
         return
-    sun_second = second
+    sun_at = (clock.day, clock.second)
     lat, lon = sky.sun_position(clock.day, clock.second)
     sun = sky.to_vector(lat, lon)
 
 
-def draw_stars():
-    shift_x = tilt.x * 6
-    shift_y = -tilt.y * 4
-    twinkle = badge.ticks // 90
-    for x, y, level, phase in STARS:
-        if (twinkle + phase) % 97 == 0:
-            level = max(0, level - 2)
+def draw_stars(radius):
+    if radius > COVERS_SCREEN:
+        return
+    # Nearer (brighter) stars drift further as the badge tilts; one star in
+    # a few dozen blinks out for a moment.
+    blink = badge.ticks // 90 % 37
+    for level in range(4):
+        dx = int(tilt.x * 1.5 * (level + 1))
+        dy = int(-tilt.y * (level + 1))
         screen.pen = STAR_PENS[level]
-        screen.put(int(x + shift_x * (level + 1) / 4) % WIDTH, int(y + shift_y * (level + 1) / 4) % HEIGHT)
+        for index, (x, y) in enumerate(STARS[level]):
+            if index != blink:
+                screen.put((x + dx) % WIDTH, (y + dy) % HEIGHT)
 
 
 def draw_glow(radius):
+    """The atmosphere outside the disc, as a ring so the hidden middle costs nothing."""
+    if radius * GLOW_FROM > COVERS_SCREEN:
+        return
     reach = radius * GLOW_REACH
     glow_brush.geometry(0.5, 0.5, 1.0, 0.5, mat3().translate(CENTRE_X - reach, CENTRE_Y - reach).scale(reach * 2, reach * 2))
     screen.pen = glow_brush
-    screen.shape(shape.circle(CENTRE_X, CENTRE_Y, reach))
+    screen.shape(shape.arc(CENTRE_X, CENTRE_Y, radius * GLOW_FROM, reach, 0, 360))
 
 
 def draw_rim(radius):
+    """Haze inside the edge of the disc."""
+    if radius * RIM_FROM > COVERS_SCREEN:
+        return
     rim_brush.geometry(0.5, 0.5, 1.0, 0.5, mat3().translate(CENTRE_X - radius, CENTRE_Y - radius).scale(radius * 2, radius * 2))
     screen.pen = rim_brush
-    screen.shape(shape.circle(CENTRE_X, CENTRE_Y, radius + 0.5))
+    screen.shape(shape.arc(CENTRE_X, CENTRE_Y, radius * RIM_FROM, radius + 0.5, 0, 360))
 
 
 def project(vector, right, up, out, radius):
@@ -460,7 +522,7 @@ def draw_sun_icon(x, y, when):
                                     vec2(x + math.cos(a) * 8, y + math.sin(a) * 8), 1.2))
     elif when == "twilight":
         screen.pen = TWILIGHT_PEN
-        screen.shape(shape.pie(x, y, 6, 180, 360))
+        screen.shape(shape.pie(x, y, 6, 270, 450))     # the top half: 0 is 12 o'clock
         screen.shape(shape.line(vec2(x - 8, y + 1.5), vec2(x + 8, y + 1.5), 1.2))
     else:
         screen.pen = MOON_PEN
@@ -478,6 +540,15 @@ def draw_lock(x, y):
 def text_width(text, typeface):
     screen.font = typeface
     return screen.measure_text(text)[0]
+
+
+def fit(text, typeface, room):
+    """The text, cut short with a full stop if it would not fit in room pixels."""
+    if text_width(text, typeface) <= room:
+        return text
+    while len(text) > 1 and text_width(text + ".", typeface) > room:
+        text = text[:-1].rstrip()
+    return text + "."
 
 
 HINTS = (
@@ -503,36 +574,35 @@ def draw_card(place, view_vector, lat, lon):
         screen.text(second, 16, top + 18)
         return
     if place is not None:
-        flags.draw(place.code, 14, top + 8, 27, 18)
-        screen.font = name_font
-        screen.pen = WHITE
-        screen.text(place.label, 50, top + 3)
-        screen.font = small_font
-        screen.pen = place.pen
-        screen.text("unlocked %d of %d" % (place.slot + 1, len(places)), 50, top + 20)
         hours, minutes, _ = sky.local_time(clock.day, clock.second, place.utc_hours, place.rule)
         stamp = "%02d:%02d" % (hours, minutes)
         when = daylight_at(place.vector)
+        left, name, pen = 50, place.label, WHITE
+        line = "unlocked %d of %d" % (place.slot + 1, len(places))
+        line_pen = place.pen
+        flags.draw(place.code, 14, top + 8, 27, 18)
     else:
-        country = globe.country_at(lat, lon)
-        left = 16
-        if country:
-            draw_lock(16, top + 9)
-            left = 36
-        screen.font = name_font
-        screen.pen = MUTED
-        screen.text(COUNTRIES[country - 1][1] if country else "Ocean", left, top + 3)
-        screen.font = small_font
-        screen.pen = color.rgb(110, 118, 132)
-        screen.text("locked" if country else "%d of %d countries unlocked" % (len(places), WORLD_COUNTRIES), left, top + 20)
         # Local solar time from the longitude, when there is no time zone to hand.
         minutes = int(clock.second / 60 + lon * 4) % 1440
         stamp = "~%02d:%02d" % (minutes // 60, minutes % 60)
         when = daylight_at(view_vector)
+        country = globe.country_at(lat, lon)
+        left, pen, line_pen = 16, MUTED, LOCKED_TEXT
+        if country:
+            draw_lock(16, top + 9)
+            left, name, line = 36, COUNTRIES[country - 1][1], "locked"
+        else:
+            name, line = "Ocean", "%d of %d countries unlocked" % (len(places), WORLD_COUNTRIES)
+    stamp_x = WIDTH - 32 - text_width(stamp, time_font)
+    screen.font = name_font
+    screen.pen = pen
+    screen.text(fit(name, name_font, stamp_x - left - 6), left, top + 3)
+    screen.font = small_font
+    screen.pen = line_pen
+    screen.text(line, left, top + 20)
     screen.font = time_font
     screen.pen = TEXT
-    width = text_width(stamp, time_font)
-    screen.text(stamp, WIDTH - 32 - width, top + 9)
+    screen.text(stamp, stamp_x, top + 9)
     draw_sun_icon(WIDTH - 21, top + 17, when)
 
 
@@ -568,9 +638,7 @@ def choose_scale(radius, view):
     """Full resolution unless the last frames say it would cost too much,
     and always once the view has held still for a few frames."""
     global scale, still_frames, last_view
-    side_x = min(WIDTH, 2 * radius)
-    side_y = min(HEIGHT, 2 * radius)
-    pixels = side_x * side_y * 0.8
+    pixels = min(WIDTH, 2 * radius + 3) * min(HEIGHT, 2 * radius + 3)
     estimate = pixels * cost_us / 1000
     if estimate > FULL_RES_MS:
         scale = 2
@@ -578,32 +646,30 @@ def choose_scale(radius, view):
         scale = 1
     still_frames = still_frames + 1 if view == last_view else 0
     last_view = view
-    return (1 if still_frames >= SETTLE_FRAMES else scale), pixels
+    return 1 if still_frames >= SETTLE_FRAMES else scale
 
 
 def update():
     global frames, report_at, cost_us
     dt = min(badge.ticks_delta, 200)
     tilt.update()
-    right, up, out, lat, lon = view_axes()
-    handle_input(dt, out)
+    handle_input(dt, sky.to_vector(cam_lat, cam_lon))
     move_camera(dt)
     clock.advance(dt)
     sync.step(clock)
     update_sun()
 
-    right, up, out, lat, lon = view_axes()
     radius = RADIUS * zoom
-    shown_scale, pixels = choose_scale(radius, (right, up, out, round(radius)))
+    right, up, out, lat, lon = view_axes(radius)
+    shown_scale = choose_scale(radius, (right, up, out, round(radius)))
 
     screen.pen = SPACE
     screen.clear()
-    draw_stars()
+    draw_stars(radius)
     draw_glow(radius)
-    started = time.ticks_us()
-    if globe.draw(CENTRE_X, CENTRE_Y, radius, right, up, out, sun, shown_scale):
-        spent = time.ticks_diff(time.ticks_us(), started)
-        cost_us += (spent * shown_scale * shown_scale / pixels - cost_us) * 0.3
+    spent, rendered = globe.draw(CENTRE_X, CENTRE_Y, radius, right, up, out, sun, shown_scale)
+    if rendered:
+        cost_us += (spent / rendered - cost_us) * 0.3
     draw_rim(radius)
     draw_markers(right, up, out, radius)
 
